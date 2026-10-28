@@ -5,6 +5,9 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -42,6 +45,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.window.OnBackInvokedDispatcher;
@@ -57,6 +61,8 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -89,9 +95,19 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
+        installCrashLog();
+        try {
+            startUi(saved);
+        } catch (Throwable t) {
+            showFatal(t);   // never just close: show what went wrong so it can be fixed
+        }
+        showLastCrash();
+    }
+
+    private void startUi(Bundle saved) {
         Window w = getWindow();
-        if (Build.VERSION.SDK_INT >= 30) w.setDecorFitsSystemWindows(false);
-        applyBarColors();
+        try { if (Build.VERSION.SDK_INT >= 30) w.setDecorFitsSystemWindows(false); } catch (Throwable ignored) { }
+        try { applyBarColors(); } catch (Throwable ignored) { }
 
         root = new FrameLayout(this);
         root.setBackgroundColor(isNight() ? Color.rgb(24, 26, 36) : Color.WHITE);
@@ -114,12 +130,74 @@ public class MainActivity extends Activity {
         }
 
         setupWebView();
-        setupBack();
+        try { setupBack(); } catch (Throwable ignored) { }
 
         String url = BuildConfig.SYNCO_URL;
         if (url == null || url.isEmpty()) url = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_URL, "");
         if (url.isEmpty()) askForAddress();
         else start(url, saved);
+    }
+
+    // ---------------------------------------------------------------- diagnostics: keep the last error, show it on the next start
+    private File crashFile() { return new File(getFilesDir(), "last-error.txt"); }
+
+    private static String trace(Throwable t) { StringWriter sw = new StringWriter(); t.printStackTrace(new PrintWriter(sw)); return sw.toString(); }
+
+    private void installCrashLog() {
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        final File f = crashFile();
+        Thread.setDefaultUncaughtExceptionHandler((th, ex) -> {
+            try (FileOutputStream os = new FileOutputStream(f)) { os.write(("Synco " + BuildConfig.VERSION_NAME + " · Android " + Build.VERSION.SDK_INT + " · " + Build.MANUFACTURER + " " + Build.MODEL + "\n\n" + trace(ex)).getBytes("UTF-8")); } catch (Throwable ignored) { }
+            if (prev != null) prev.uncaughtException(th, ex);
+        });
+    }
+
+    private void logError(Throwable t) {
+        try (FileOutputStream os = new FileOutputStream(new File(getFilesDir(), "warnings.txt"), true)) { os.write(trace(t).getBytes("UTF-8")); } catch (Throwable ignored) { }
+    }
+
+    private void showLastCrash() {
+        File f = crashFile();
+        if (!f.exists()) return;
+        try {
+            byte[] b = new byte[(int) Math.min(f.length(), 20000)];
+            try (java.io.FileInputStream in = new java.io.FileInputStream(f)) { int n = 0, r; while (n < b.length && (r = in.read(b, n, b.length - n)) > 0) n += r; }
+            f.delete();
+            final String txt = new String(b, "UTF-8");
+            new AlertDialog.Builder(this).setTitle("האפליקציה נסגרה בפעם הקודמת")
+                    .setMessage("לחצו \"העתקה\" ושלחו את הפרטים כדי שנתקן.\n\n" + (txt.length() > 1500 ? txt.substring(0, 1500) + "…" : txt))
+                    .setPositiveButton("העתקה", (d, i) -> copy(txt)).setNegativeButton("סגירה", null).show();
+        } catch (Throwable ignored) { }
+    }
+
+    private void copy(String txt) {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(ClipData.newPlainText("Synco error", txt));
+            Toast.makeText(this, "הועתק – הדביקו ושלחו", Toast.LENGTH_LONG).show();
+        } catch (Throwable ignored) { }
+    }
+
+    private void showFatal(Throwable t) {
+        final String txt = "Synco " + BuildConfig.VERSION_NAME + " · Android " + Build.VERSION.SDK_INT + " · " + Build.MANUFACTURER + " " + Build.MODEL + "\n\n" + trace(t);
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        l.setPadding(dp(20), dp(48), dp(20), dp(20));
+        TextView h = new TextView(this);
+        h.setText("משהו השתבש בפתיחה");
+        h.setTextSize(20);
+        Button b = new Button(this);
+        b.setText("העתקת הפרטים");
+        b.setOnClickListener(v -> copy(txt));
+        TextView d = new TextView(this);
+        d.setText(txt);
+        d.setTextSize(12);
+        d.setTextIsSelectable(true);
+        d.setTextDirection(View.TEXT_DIRECTION_LTR);
+        ScrollView sv = new ScrollView(this);
+        sv.addView(d);
+        l.addView(h); l.addView(b); l.addView(sv);
+        setContentView(l);
     }
 
     private void start(String url, Bundle saved) {
@@ -172,7 +250,7 @@ public class MainActivity extends Activity {
         s.setUseWideViewPort(true);
         s.setBuiltInZoomControls(false);
         s.setUserAgentString(s.getUserAgentString() + " SyncoAndroid/" + BuildConfig.VERSION_NAME);
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) androidx.webkit.WebSettingsCompat.setSafeBrowsingEnabled(s, true);
+        try { if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) androidx.webkit.WebSettingsCompat.setSafeBrowsingEnabled(s, true); } catch (Throwable ignored) { }
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
         cm.setAcceptThirdPartyCookies(web, true);   // Google serves the app inside its own frame
@@ -184,7 +262,7 @@ public class MainActivity extends Activity {
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
                 Uri u = r.getUrl();
                 String sch = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.ROOT);
-                if (sch.equals("https") && (allowedHost(u.getHost()) || !r.isForMainFrame())) return false;
+                if (sch.equals("https") && (navAllowed(u.getHost()) || !r.isForMainFrame())) return false;
                 openOutside(u);
                 return true;
             }
@@ -197,6 +275,16 @@ public class MainActivity extends Activity {
                 bar.setVisibility(View.GONE);
                 if (!mainError) offline.setVisibility(View.GONE);
                 CookieManager.getInstance().flush();
+            }
+
+            @Override
+            public boolean onRenderProcessGone(WebView v, android.webkit.RenderProcessGoneDetail d) {
+                // the page's process died (low memory / WebView update): keep the app alive and offer a reload
+                logError(new RuntimeException("WebView renderer gone, crash=" + (d != null && d.didCrash())));
+                try { root.removeView(v); v.destroy(); } catch (Throwable ignored) { }
+                web = null;
+                showFatal(new RuntimeException("התצוגה נסגרה. סגרו ופתחו את האפליקציה שוב."));
+                return true;
             }
 
             @Override
@@ -248,7 +336,7 @@ public class MainActivity extends Activity {
                     private void route(Uri u) {
                         if (done) return; done = true;
                         String sch = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.ROOT);
-                        if (sch.equals("https") && allowedHost(u.getHost())) web.loadUrl(u.toString()); else openOutside(u);
+                        if (sch.equals("https") && navAllowed(u.getHost()) && web != null) web.loadUrl(u.toString()); else openOutside(u);
                         tmp.post(tmp::destroy);
                     }
                     @Override public boolean shouldOverrideUrlLoading(WebView w2, WebResourceRequest r) { route(r.getUrl()); return true; }
@@ -269,13 +357,15 @@ public class MainActivity extends Activity {
         rules.add("https://" + homeHost);
         rules.add("https://script.google.com");
         rules.add("https://*.googleusercontent.com");
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
-            WebViewCompat.addWebMessageListener(web, "SyncoNative", rules, (view, message, origin, mainFrame, reply) -> {
-                if (!allowedHost(origin.getHost())) return;
-                String data = message.getData();
-                if (data != null) handleMessage(data);
-            });
-        }
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                WebViewCompat.addWebMessageListener(web, "SyncoNative", rules, (view, message, origin, mainFrame, reply) -> {
+                    if (origin == null || !allowedHost(origin.getHost())) return;
+                    String data = message.getData();
+                    if (data != null) handleMessage(data);
+                });
+            }
+        } catch (Throwable t) { logError(t); }
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             try {
                 java.io.InputStream in = getAssets().open("synco-bridge.js");
@@ -283,8 +373,16 @@ public class MainActivity extends Activity {
                 int n = 0, r; while (n < b.length && (r = in.read(b, n, b.length - n)) > 0) n += r;
                 in.close();
                 WebViewCompat.addDocumentStartJavaScript(web, new String(b, 0, n, "UTF-8"), rules);
-            } catch (IOException ignored) { }
+            } catch (Throwable t) { logError(t); }
         }
+    }
+
+    /** Pages that may open inside the app: Synco itself plus Google's own sign-in / redirect pages (the bridge stays limited to allowedHost). */
+    private boolean navAllowed(String h) {
+        if (h == null) return false;
+        if (allowedHost(h)) return true;
+        h = h.toLowerCase(Locale.ROOT);
+        return h.equals("accounts.google.com") || h.equals("www.google.com") || h.equals("google.com") || h.endsWith(".google.com");
     }
 
     private boolean allowedHost(String h) {
