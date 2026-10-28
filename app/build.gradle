@@ -1,0 +1,44 @@
+plugins { id 'com.android.application' }
+
+// The address of your Synco (Google Apps Script web app) – read from synco-url.txt in the project root.
+def syncoUrl = rootProject.file('synco-url.txt').exists() ? rootProject.file('synco-url.txt').text.trim() : ''
+if (!(syncoUrl ==~ /^https:\/\/[^\s"\\]+$/) || syncoUrl.contains('PASTE-YOUR-ID')) syncoUrl = ''   // empty → the app asks for the address on first run
+def runNo = (System.getenv('GITHUB_RUN_NUMBER') ?: '1') as int
+def ks = System.getenv('SYNCO_KEYSTORE')
+
+android {
+    namespace 'com.ronenmoses.synco'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.ronenmoses.synco'
+        minSdk 24
+        targetSdk 35
+        versionCode runNo
+        versionName "1.0.${runNo}"
+        buildConfigField 'String', 'SYNCO_URL', "\"${syncoUrl}\""
+    }
+    signingConfigs {
+        release {
+            if (ks && new File(ks).exists()) {
+                storeFile new File(ks)
+                storePassword System.getenv('SYNCO_KS_PASS')
+                keyAlias System.getenv('SYNCO_KEY_ALIAS') ?: 'synco'
+                keyPassword System.getenv('SYNCO_KS_PASS')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig = ((ks && new File(ks).exists()) ? signingConfigs.release : signingConfigs.debug)
+        }
+    }
+    buildFeatures { buildConfig true }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    lint { abortOnError false; checkReleaseBuilds false }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.12.1'
+    implementation 'androidx.core:core:1.13.1'
+}
