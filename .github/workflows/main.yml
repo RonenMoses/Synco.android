@@ -1,0 +1,73 @@
+name: Build Synco APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the project folder
+        run: |
+          G="$(find . -name gradlew -not -path './.git/*' | head -1)"
+          if [ -z "$G" ]; then echo "::error::gradlew was not found – upload all the project files (app, gradle, gradlew, build.gradle, settings.gradle...)"; exit 1; fi
+          D="$(dirname "$G")"; echo "PROJ=$D" >> "$GITHUB_ENV"; echo "Project folder: $D"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Check the Synco address
+        run: |
+          URL="$(tr -d '\r\n ' < "$PROJ/synco-url.txt" 2>/dev/null)"
+          if [[ ! "$URL" =~ ^https:// ]] || [[ "$URL" == *PASTE-YOUR-ID* ]]; then
+            echo "::warning::synco-url.txt has no Synco address yet – the app will ask for it on first run."
+          else
+            echo "Synco address: $URL"
+          fi
+
+      - name: Signing key (from repository secrets, if set)
+        env:
+          SIGNING_KEY_B64: ${{ secrets.SIGNING_KEY_B64 }}
+        run: |
+          if [ -n "$SIGNING_KEY_B64" ]; then
+            echo "$SIGNING_KEY_B64" | base64 -d > "$RUNNER_TEMP/synco.jks"
+            echo "SYNCO_KEYSTORE=$RUNNER_TEMP/synco.jks" >> "$GITHUB_ENV"
+            echo "Signing with your own key."
+          else
+            echo "::warning::No SIGNING_KEY_B64 secret – the APK is signed with a temporary key. Add the secrets so future updates install over the old app."
+          fi
+
+      - name: Build
+        env:
+          SYNCO_KS_PASS: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          cd "$PROJ"
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/Synco.apk"
+          cd "$GITHUB_WORKSPACE"
+          ls -l Synco.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Synco-apk
+          path: Synco.apk
+
+      - name: Publish a release (download link)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Synco 1.0.${{ github.run_number }}
+          body: "Synco לאנדרואיד – מורידים את Synco.apk ומתקינים בטלפון."
+          files: Synco.apk
+          make_latest: true
