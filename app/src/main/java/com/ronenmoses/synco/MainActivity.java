@@ -4,6 +4,12 @@ import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.KeyguardManager;
+import android.hardware.biometrics.BiometricManager;
+import android.hardware.biometrics.BiometricPrompt;
+import android.os.CancellationSignal;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -51,6 +57,7 @@ import android.widget.Toast;
 import android.window.OnBackInvokedDispatcher;
 
 import androidx.core.content.FileProvider;
+import androidx.webkit.JavaScriptReplyProxy;
 import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 
@@ -68,6 +75,11 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
+import java.security.KeyStore;
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 
 /**
  * Synco for Android – a secure, full-screen shell around the user's own Synco (Google Apps Script web app).
@@ -136,6 +148,108 @@ public class MainActivity extends Activity {
         if (url == null || url.isEmpty()) url = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_URL, "");
         if (url.isEmpty()) askForAddress();
         else start(url, saved);
+    }
+
+    // ---------------------------------------------------------------- fingerprint / face sign-in
+    private static final String BIO_KEY = "synco_bio_key", BIO_PREFS = "synco_bio";
+
+    private void bioReply(JavaScriptReplyProxy r, String rid, JSONObject o) {
+        if (r == null) return;
+        try { o.put("rid", rid); final String s = o.toString(); runOnUiThread(() -> { try { r.postMessage(s); } catch (Throwable ignored) { } }); } catch (Throwable ignored) { }
+    }
+
+    private boolean bioAvailable() {
+        try {
+            if (Build.VERSION.SDK_INT < 28) return false;
+            if (Build.VERSION.SDK_INT >= 30) {
+                BiometricManager bm = getSystemService(BiometricManager.class);
+                return bm != null && bm.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) == BiometricManager.BIOMETRIC_SUCCESS;
+            }
+            if (Build.VERSION.SDK_INT == 29) {
+                BiometricManager bm = getSystemService(BiometricManager.class);
+                return bm != null && bm.canAuthenticate() == BiometricManager.BIOMETRIC_SUCCESS;
+            }
+            KeyguardManager km = getSystemService(KeyguardManager.class);
+            return km != null && km.isKeyguardSecure() && getPackageManager().hasSystemFeature(PackageManager.FEATURE_FINGERPRINT);
+        } catch (Throwable t) { return false; }
+    }
+
+    /** AES-256-GCM key that lives inside the phone's secure hardware and can never be read out. */
+    private SecretKey bioKey(boolean create) throws Exception {
+        KeyStore ks = KeyStore.getInstance("AndroidKeyStore");
+        ks.load(null);
+        if (ks.containsAlias(BIO_KEY)) return (SecretKey) ks.getKey(BIO_KEY, null);
+        if (!create) return null;
+        KeyGenerator kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore");
+        kg.init(new KeyGenParameterSpec.Builder(BIO_KEY, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).setKeySize(256).build());
+        return kg.generateKey();
+    }
+
+    private interface BioDone { void ok(); void fail(String msg); }
+
+    private void bioPrompt(String title, BioDone done) {
+        if (Build.VERSION.SDK_INT < 28) { done.fail("המכשיר לא תומך"); return; }
+        try {
+            BiometricPrompt.Builder b = new BiometricPrompt.Builder(this).setTitle(title).setSubtitle("Synco");
+            if (Build.VERSION.SDK_INT >= 30) b.setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_WEAK);
+            b.setNegativeButton("ביטול", getMainExecutor(), (d, w) -> done.fail(""));
+            b.build().authenticate(new CancellationSignal(), getMainExecutor(), new BiometricPrompt.AuthenticationCallback() {
+                @Override public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult r) { done.ok(); }
+                @Override public void onAuthenticationError(int code, CharSequence msg) { done.fail(code == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED || code == BiometricPrompt.BIOMETRIC_ERROR_CANCELED ? "" : String.valueOf(msg)); }
+            });
+        } catch (Throwable t) { logError(t); done.fail("לא הצלחנו לפתוח את הזיהוי"); }
+    }
+
+    private void handleBio(JSONObject o, JavaScriptReplyProxy reply) {
+        final String rid = o.optString("rid"), op = o.optString("op");
+        final SharedPreferences sp = getSharedPreferences(BIO_PREFS, MODE_PRIVATE);
+        try {
+            if (op.equals("status")) {
+                JSONObject r = new JSONObject();
+                r.put("available", bioAvailable()); r.put("enrolled", sp.contains("blob")); r.put("user", sp.getString("user", ""));
+                bioReply(reply, rid, r);
+            } else if (op.equals("clear")) {
+                sp.edit().clear().apply();
+                try { KeyStore ks = KeyStore.getInstance("AndroidKeyStore"); ks.load(null); ks.deleteEntry(BIO_KEY); } catch (Throwable ignored) { }
+                bioReply(reply, rid, new JSONObject().put("ok", true));
+            } else if (op.equals("save")) {
+                final String u = o.optString("u"), p = o.optString("p");
+                if (u.isEmpty() || p.isEmpty() || u.length() > 200 || p.length() > 500 || !bioAvailable()) { bioReply(reply, rid, new JSONObject().put("ok", false).put("msg", "לא זמין במכשיר הזה")); return; }
+                Runnable store = () -> {
+                    try {
+                        Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                        c.init(Cipher.ENCRYPT_MODE, bioKey(true));
+                        byte[] ct = c.doFinal(new JSONObject().put("u", u).put("p", p).toString().getBytes("UTF-8"));
+                        sp.edit().putString("iv", Base64.encodeToString(c.getIV(), Base64.NO_WRAP)).putString("blob", Base64.encodeToString(ct, Base64.NO_WRAP)).putString("user", u).apply();
+                        bioReply(reply, rid, new JSONObject().put("ok", true));
+                    } catch (Throwable t) { logError(t); try { bioReply(reply, rid, new JSONObject().put("ok", false).put("msg", "לא הצלחנו לשמור")); } catch (Throwable ignored) { } }
+                };
+                if (o.optBoolean("silent") && u.equals(sp.getString("user", ""))) store.run();   // same user, new password – already unlocked with the password itself
+                else bioPrompt("אישור עם טביעת אצבע / פנים", new BioDone() {
+                    public void ok() { store.run(); }
+                    public void fail(String m) { try { bioReply(reply, rid, new JSONObject().put("ok", false).put("msg", m)); } catch (Throwable ignored) { } }
+                });
+            } else if (op.equals("get")) {
+                if (!sp.contains("blob")) { bioReply(reply, rid, new JSONObject().put("ok", false)); return; }
+                bioPrompt("כניסה ל-Synco", new BioDone() {
+                    public void ok() {
+                        try {
+                            SecretKey k = bioKey(false);
+                            if (k == null) throw new IllegalStateException("no key");
+                            Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                            c.init(Cipher.DECRYPT_MODE, k, new GCMParameterSpec(128, Base64.decode(sp.getString("iv", ""), Base64.NO_WRAP)));
+                            JSONObject v = new JSONObject(new String(c.doFinal(Base64.decode(sp.getString("blob", ""), Base64.NO_WRAP)), "UTF-8"));
+                            bioReply(reply, rid, new JSONObject().put("ok", true).put("u", v.optString("u")).put("p", v.optString("p")));
+                        } catch (Throwable t) {
+                            logError(t); sp.edit().clear().apply();
+                            try { bioReply(reply, rid, new JSONObject().put("ok", false).put("msg", "צריך להיכנס שוב עם סיסמה ולהפעיל מחדש")); } catch (Throwable ignored) { }
+                        }
+                    }
+                    public void fail(String m) { try { bioReply(reply, rid, new JSONObject().put("ok", false).put("msg", m)); } catch (Throwable ignored) { } }
+                });
+            }
+        } catch (Throwable t) { logError(t); }
     }
 
     // ---------------------------------------------------------------- diagnostics: keep the last error, show it on the next start
@@ -362,7 +476,7 @@ public class MainActivity extends Activity {
                 WebViewCompat.addWebMessageListener(web, "SyncoNative", rules, (view, message, origin, mainFrame, reply) -> {
                     if (origin == null || !allowedHost(origin.getHost())) return;
                     String data = message.getData();
-                    if (data != null) handleMessage(data);
+                    if (data != null) handleMessage(data, reply);
                 });
             }
         } catch (Throwable t) { logError(t); }
@@ -392,11 +506,12 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------------- messages from the page
-    private void handleMessage(String json) {
+    private void handleMessage(String json, JavaScriptReplyProxy reply) {
         try {
             JSONObject o = new JSONObject(json);
             String t = o.optString("t");
             switch (t) {
+                case "bio": final JSONObject bo = o; runOnUiThread(() -> handleBio(bo, reply)); break;
                 case "save": saveFile(o.optString("name"), o.optString("mime"), o.optString("b64")); break;
                 case "share": shareFrom(o); break;
                 case "wake": final boolean on = o.optBoolean("on");
