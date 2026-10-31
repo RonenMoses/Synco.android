@@ -50,7 +50,7 @@
         </activity>
 
         <!-- phone reminders: fires at the chosen time, and sets everything again after a restart -->
-        <receiver android:name=".NotifReceiver" android:exported="true">
+        <receiver android:name=".MainActivity$NotifReceiver" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
