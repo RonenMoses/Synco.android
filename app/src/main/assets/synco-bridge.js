@@ -12,6 +12,13 @@
       return toB64(bl).then(function (b) { send({ t: 'save', name: name || 'Synco', mime: bl.type || 'application/octet-stream', b64: b }); });
     }).catch(function () { send({ t: 'toast', m: 'ההורדה נכשלה' }); });
   }
+  // replies from the app (fingerprint / face sign-in)
+  var cbs = {}, seq = 0;
+  N.onmessage = function (e) { var d; try { d = JSON.parse(e.data); } catch (x) { return; } if (d && d.rid && cbs[d.rid]) { var f = cbs[d.rid]; delete cbs[d.rid]; f(d); } };
+  window.SyncoBio = { call: function (op, extra) { return new Promise(function (res) {
+    var rid = 'b' + (++seq); cbs[rid] = res; var o = { t: 'bio', op: op, rid: rid }; extra = extra || {}; for (var k in extra) o[k] = extra[k]; send(o);
+    setTimeout(function () { if (cbs[rid]) { delete cbs[rid]; res({ ok: false, timeout: true }); } }, op === 'status' || op === 'clear' ? 5000 : 120000);
+  }); } };
   // downloads: <a download href="blob:…"> (Excel, PDF, backups)
   document.addEventListener('click', function (e) {
     var a = e.target && e.target.closest ? e.target.closest('a[download]') : null; if (!a) return;
