@@ -5,6 +5,12 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.KeyguardManager;
+import android.app.AlarmManager;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
 import android.hardware.biometrics.BiometricManager;
 import android.hardware.biometrics.BiometricPrompt;
 import android.os.CancellationSignal;
@@ -889,4 +895,138 @@ public class MainActivity extends Activity {
     private boolean isNight() { return (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES; }
 
     private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+    /**
+     * Phone notifications for Synco: the web app sends the list of upcoming reminders (events, tours, tasks, bills…),
+     * we keep it on the phone and let Android's alarm clock wake us at the right time – even when the app is closed.
+     * After a restart of the phone (or an app update) the reminders are scheduled again.
+     */
+    public static class NotifReceiver extends BroadcastReceiver {
+        static final String CH = "synco_alerts", PREFS = "synco_notif", ACT_FIRE = "com.ronenmoses.synco.NOTIFY";
+        static final int MAX = 120;
+
+        @Override
+        public void onReceive(Context c, Intent i) {
+            String a = i == null ? null : i.getAction();
+            if (a == null) return;
+            try {
+                if (ACT_FIRE.equals(a)) {
+                    String id = i.getStringExtra("id");
+                    JSONObject o = find(c, id);          // only reminders the app itself saved – nothing from outside
+                    if (o != null) show(c, o.optString("id"), o.optString("title"), o.optString("body"), o.optString("go"));
+                } else if (Intent.ACTION_BOOT_COMPLETED.equals(a) || "android.intent.action.MY_PACKAGE_REPLACED".equals(a)
+                        || "android.intent.action.TIME_SET".equals(a) || "android.intent.action.TIMEZONE_CHANGED".equals(a)) {
+                    schedule(c, load(c));
+                }
+            } catch (Throwable ignored) { }
+        }
+
+        static SharedPreferences sp(Context c) { return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE); }
+
+        static JSONArray load(Context c) {
+            try { return new JSONArray(sp(c).getString("items", "[]")); } catch (Throwable t) { return new JSONArray(); }
+        }
+
+        static JSONObject find(Context c, String id) {
+            if (id == null) return null;
+            JSONArray a = load(c);
+            for (int k = 0; k < a.length(); k++) { JSONObject o = a.optJSONObject(k); if (o != null && id.equals(o.optString("id"))) return o; }
+            return null;
+        }
+
+        static void channel(Context c) {
+            if (Build.VERSION.SDK_INT < 26) return;
+            NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null || nm.getNotificationChannel(CH) != null) return;
+            NotificationChannel ch = new NotificationChannel(CH, "תזכורות Synco", NotificationManager.IMPORTANCE_HIGH);
+            ch.setDescription("אירועים, טיולים, משימות וחשבונות שבחרתם");
+            nm.createNotificationChannel(ch);
+        }
+
+        static boolean allowed(Context c) {
+            if (Build.VERSION.SDK_INT >= 33 && c.checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) return false;
+            NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+            return nm == null || Build.VERSION.SDK_INT < 24 || nm.areNotificationsEnabled();
+        }
+
+        static boolean exactOk(Context c) {
+            if (Build.VERSION.SDK_INT < 31) return true;
+            AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+            return am != null && am.canScheduleExactAlarms();
+        }
+
+        private static PendingIntent alarmIntent(Context c, String id) {
+            Intent i = new Intent(c, NotifReceiver.class).setAction(ACT_FIRE);
+            i.putExtra("id", id);
+            return PendingIntent.getBroadcast(c, id.hashCode(), i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        }
+
+        /** Replace the whole list: cancel what was there, save the new list, set an alarm for each future reminder. */
+        static int replace(Context c, JSONArray items) {
+            AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+            JSONArray old = load(c);
+            if (am != null) for (int k = 0; k < old.length(); k++) { JSONObject o = old.optJSONObject(k); if (o != null) am.cancel(alarmIntent(c, o.optString("id"))); }
+            JSONArray keep = new JSONArray();
+            long now = System.currentTimeMillis();
+            for (int k = 0; k < items.length() && keep.length() < MAX; k++) {
+                JSONObject o = items.optJSONObject(k);
+                if (o == null) continue;
+                String id = o.optString("id"), title = o.optString("title");
+                long at = o.optLong("at");
+                if (id.isEmpty() || id.length() > 120 || title.isEmpty() || at <= now) continue;
+                try {
+                    JSONObject s = new JSONObject();
+                    s.put("id", id); s.put("at", at);
+                    s.put("title", title.length() > 120 ? title.substring(0, 120) : title);
+                    String body = o.optString("body"); s.put("body", body.length() > 400 ? body.substring(0, 400) : body);
+                    String go = o.optString("go"); if (go.startsWith("#/") && go.length() < 200) s.put("go", go);
+                    keep.put(s);
+                } catch (Throwable ignored) { }
+            }
+            sp(c).edit().putString("items", keep.toString()).apply();
+            return schedule(c, keep);
+        }
+
+        static int schedule(Context c, JSONArray items) {
+            AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+            if (am == null) return 0;
+            boolean exact = exactOk(c);
+            long now = System.currentTimeMillis();
+            int n = 0;
+            for (int k = 0; k < items.length(); k++) {
+                JSONObject o = items.optJSONObject(k);
+                if (o == null) continue;
+                long at = o.optLong("at");
+                if (at <= now) continue;
+                PendingIntent p = alarmIntent(c, o.optString("id"));
+                try {
+                    if (Build.VERSION.SDK_INT >= 23) {
+                        if (exact) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p);
+                        else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p);
+                    } else am.set(AlarmManager.RTC_WAKEUP, at, p);
+                    n++;
+                } catch (SecurityException e) {
+                    try { am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p); n++; } catch (Throwable ignored) { }
+                }
+            }
+            return n;
+        }
+
+        static void show(Context c, String id, String title, String body, String go) {
+            channel(c);
+            if (!allowed(c)) return;
+            Intent open = new Intent(c, MainActivity.class).setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            if (go != null && go.startsWith("#/")) open.putExtra("go", go);
+            PendingIntent pi = PendingIntent.getActivity(c, id.hashCode(), open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(c, CH) : new Notification.Builder(c);
+            int ic = c.getResources().getIdentifier("ic_stat_synco", "drawable", c.getPackageName());
+            if (ic == 0) ic = android.R.drawable.ic_popup_reminder;
+            b.setSmallIcon(ic).setContentTitle(title).setContentText(body)
+                    .setStyle(new Notification.BigTextStyle().bigText(body)).setAutoCancel(true).setContentIntent(pi)
+                    .setWhen(System.currentTimeMillis()).setShowWhen(true).setColor(0xFF6C5CE7);
+            if (Build.VERSION.SDK_INT < 26) b.setPriority(Notification.PRIORITY_HIGH).setDefaults(Notification.DEFAULT_ALL);
+            NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) nm.notify(id.hashCode(), b.build());
+        }
+    }
 }
