@@ -86,7 +86,8 @@ import javax.crypto.spec.GCMParameterSpec;
  * Only the configured Synco address (and Google's app frames) open inside; anything else goes to the browser / other apps.
  */
 public class MainActivity extends Activity {
-    private static final int REQ_FILE = 11, REQ_PERM_CAMERA = 21, REQ_PERM_LOCATION = 22, REQ_PERM_CHOOSER = 23;
+    private static final int REQ_FILE = 11, REQ_PERM_CAMERA = 21, REQ_PERM_LOCATION = 22, REQ_PERM_CHOOSER = 23, REQ_PERM_NOTIF = 24;
+    private JavaScriptReplyProxy notifReply; private String notifRid; private String pendingGo;
     private static final String PREFS = "synco", KEY_URL = "url";
 
     private WebView web;
@@ -114,6 +115,19 @@ public class MainActivity extends Activity {
             showFatal(t);   // never just close: show what went wrong so it can be fixed
         }
         showLastCrash();
+        takeGo(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent i) { super.onNewIntent(i); setIntent(i); takeGo(i); }
+
+    /** a tap on a Synco notification opens the right screen (the page asks for it with op "pending", or we push it) */
+    private void takeGo(Intent i) {
+        try { String g = i == null ? null : i.getStringExtra("go"); if (g != null && g.startsWith("#/")) { pendingGo = g; i.removeExtra("go"); pushGo(); } } catch (Throwable ignored) { }
+    }
+    private void pushGo() {
+        if (pendingGo == null || notifReply == null) return;
+        try { final String g = pendingGo; pendingGo = null; final JavaScriptReplyProxy r = notifReply; final String s = new JSONObject().put("t", "go").put("go", g).toString(); runOnUiThread(() -> { try { r.postMessage(s); } catch (Throwable ignored) { } }); } catch (Throwable ignored) { }
     }
 
     private void startUi(Bundle saved) {
@@ -174,6 +188,76 @@ public class MainActivity extends Activity {
         } catch (Throwable t) { return false; }
     }
 
+    /** the phone has a fingerprint reader / face unlock, even if nothing is set up in it yet */
+    private boolean bioHardware() {
+        try {
+            if (Build.VERSION.SDK_INT >= 30) { BiometricManager bm = getSystemService(BiometricManager.class); int s = bm == null ? -1 : bm.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK); return s == BiometricManager.BIOMETRIC_SUCCESS || s == BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED; }
+            if (Build.VERSION.SDK_INT == 29) { BiometricManager bm = getSystemService(BiometricManager.class); int s = bm == null ? -1 : bm.canAuthenticate(); return s == BiometricManager.BIOMETRIC_SUCCESS || s == BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED; }
+            PackageManager pm = getPackageManager();
+            return pm.hasSystemFeature(PackageManager.FEATURE_FINGERPRINT) || (Build.VERSION.SDK_INT >= 29 && pm.hasSystemFeature(PackageManager.FEATURE_FACE));
+        } catch (Throwable t) { return false; }
+    }
+
+    /** open the phone's own screen for adding a fingerprint / face (Synco then uses what the phone already knows) */
+    private void bioEnroll() {
+        Intent i;
+        if (Build.VERSION.SDK_INT >= 30) { i = new Intent(android.provider.Settings.ACTION_BIOMETRIC_ENROLL); i.putExtra(android.provider.Settings.EXTRA_BIOMETRIC_AUTHENTICATORS_ALLOWED, BiometricManager.Authenticators.BIOMETRIC_WEAK); }
+        else if (Build.VERSION.SDK_INT >= 28) i = new Intent(android.provider.Settings.ACTION_FINGERPRINT_ENROLL);
+        else i = new Intent(android.provider.Settings.ACTION_SECURITY_SETTINGS);
+        try { startActivity(i); } catch (Throwable t) { try { startActivity(new Intent(android.provider.Settings.ACTION_SECURITY_SETTINGS)); } catch (Throwable ignored) { } }
+    }
+
+    // ---------------------------------------------------------------- phone notifications (reminders the web app chose)
+    private void notifStatus(JavaScriptReplyProxy reply, String rid) {
+        try {
+            JSONObject r = new JSONObject();
+            r.put("ok", true); r.put("perm", NotifReceiver.allowed(this)); r.put("exact", NotifReceiver.exactOk(this)); r.put("count", NotifReceiver.load(this).length());
+            r.put("ask", Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED);
+            bioReply(reply, rid, r);
+        } catch (Throwable ignored) { }
+    }
+
+    private void handleNotif(JSONObject o, JavaScriptReplyProxy reply) {
+        final String rid = o.optString("rid"), op = o.optString("op");
+        notifReply = reply;
+        try {
+            NotifReceiver.channel(this);
+            switch (op) {
+                case "status": notifStatus(reply, rid); break;
+                case "perm":
+                    if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                        notifRid = rid; requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_PERM_NOTIF);
+                    } else notifStatus(reply, rid);
+                    break;
+                case "sync": {
+                    JSONArray a = o.optJSONArray("items"); if (a == null) a = new JSONArray();
+                    int n = NotifReceiver.replace(this, a);
+                    bioReply(reply, rid, new JSONObject().put("ok", true).put("count", n));
+                    break;
+                }
+                case "test":
+                    NotifReceiver.show(this, "test-" + System.currentTimeMillis(), o.optString("title", "Synco"), o.optString("body", "ההתראות עובדות 🎉"), "");
+                    notifStatus(reply, rid);
+                    break;
+                case "settings": {
+                    Intent i;
+                    if (Build.VERSION.SDK_INT >= 26) { i = new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS); i.putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName()); }
+                    else { i = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS); i.setData(Uri.parse("package:" + getPackageName())); }
+                    try { startActivity(i); } catch (Throwable ignored) { }
+                    bioReply(reply, rid, new JSONObject().put("ok", true));
+                    break;
+                }
+                case "pending": {
+                    JSONObject r = new JSONObject().put("ok", true);
+                    if (pendingGo != null) { r.put("go", pendingGo); pendingGo = null; }
+                    bioReply(reply, rid, r);
+                    break;
+                }
+                default: break;
+            }
+        } catch (Throwable t) { logError(t); }
+    }
+
     /** AES-256-GCM key that lives inside the phone's secure hardware and can never be read out. */
     private SecretKey bioKey(boolean create) throws Exception {
         KeyStore ks = KeyStore.getInstance("AndroidKeyStore");
@@ -207,8 +291,11 @@ public class MainActivity extends Activity {
         try {
             if (op.equals("status")) {
                 JSONObject r = new JSONObject();
-                r.put("available", bioAvailable()); r.put("enrolled", sp.contains("blob")); r.put("user", sp.getString("user", ""));
+                r.put("available", bioAvailable()); r.put("hw", bioHardware()); r.put("enrolled", sp.contains("blob")); r.put("user", sp.getString("user", ""));
                 bioReply(reply, rid, r);
+            } else if (op.equals("enroll")) {
+                bioEnroll();
+                bioReply(reply, rid, new JSONObject().put("ok", true));
             } else if (op.equals("clear")) {
                 sp.edit().clear().apply();
                 try { KeyStore ks = KeyStore.getInstance("AndroidKeyStore"); ks.load(null); ks.deleteEntry(BIO_KEY); } catch (Throwable ignored) { }
@@ -360,8 +447,9 @@ public class MainActivity extends Activity {
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        s.setLoadWithOverviewMode(true);
-        s.setUseWideViewPort(true);
+        s.setLoadWithOverviewMode(false);   // always the phone layout – never the zoomed-out "desktop" page
+        s.setUseWideViewPort(false);
+        s.setTextZoom(100);                 // the page has its own text-size control; the phone's big-font setting made the sign-in screen huge
         s.setBuiltInZoomControls(false);
         s.setUserAgentString(s.getUserAgentString() + " SyncoAndroid/" + BuildConfig.VERSION_NAME);
         try { if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) androidx.webkit.WebSettingsCompat.setSafeBrowsingEnabled(s, true); } catch (Throwable ignored) { }
@@ -370,6 +458,7 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(web, true);   // Google serves the app inside its own frame
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
         web.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        web.setBackgroundColor(isNight() ? Color.rgb(24, 26, 36) : Color.WHITE);
 
         web.setWebViewClient(new WebViewClient() {
             @Override
@@ -512,6 +601,7 @@ public class MainActivity extends Activity {
             String t = o.optString("t");
             switch (t) {
                 case "bio": final JSONObject bo = o; runOnUiThread(() -> handleBio(bo, reply)); break;
+                case "notif": final JSONObject no = o; runOnUiThread(() -> handleNotif(no, reply)); break;
                 case "save": saveFile(o.optString("name"), o.optString("mime"), o.optString("b64")); break;
                 case "share": shareFrom(o); break;
                 case "wake": final boolean on = o.optBoolean("on");
@@ -696,6 +786,9 @@ public class MainActivity extends Activity {
         } else if (req == REQ_PERM_LOCATION && pendingGeoCb != null) {
             pendingGeoCb.invoke(pendingGeoOrigin, ok, false);
             pendingGeoCb = null; pendingGeoOrigin = null;
+        } else if (req == REQ_PERM_NOTIF) {
+            if (notifReply != null) notifStatus(notifReply, notifRid == null ? "" : notifRid);
+            notifRid = null;
         } else if (req == REQ_PERM_CHOOSER && pendingParams != null) {
             openChooser(pendingParams);   // with or without the camera option
             pendingParams = null;
