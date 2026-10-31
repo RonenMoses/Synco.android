@@ -1,5 +1,6 @@
 /* Synco Android bridge – runs at document start in Synco frames only (origin-restricted by the app).
-   Gives the web app what a WebView lacks: file downloads (blob:/data:), share sheet, screen wake lock. */
+   Gives the web app what a WebView lacks: file downloads (blob:/data:), share sheet, screen wake lock,
+   fingerprint / face sign-in and phone notifications. */
 (function () {
   if (window.__syncoBridge) return; window.__syncoBridge = 1;
   var N = window.SyncoNative; if (!N || !N.postMessage) return;
@@ -14,11 +15,15 @@
   }
   // replies from the app (fingerprint / face sign-in)
   var cbs = {}, seq = 0;
-  N.onmessage = function (e) { var d; try { d = JSON.parse(e.data); } catch (x) { return; } if (d && d.rid && cbs[d.rid]) { var f = cbs[d.rid]; delete cbs[d.rid]; f(d); } };
-  window.SyncoBio = { call: function (op, extra) { return new Promise(function (res) {
-    var rid = 'b' + (++seq); cbs[rid] = res; var o = { t: 'bio', op: op, rid: rid }; extra = extra || {}; for (var k in extra) o[k] = extra[k]; send(o);
-    setTimeout(function () { if (cbs[rid]) { delete cbs[rid]; res({ ok: false, timeout: true }); } }, op === 'status' || op === 'clear' ? 5000 : 120000);
-  }); } };
+  N.onmessage = function (e) { var d; try { d = JSON.parse(e.data); } catch (x) { return; }
+    if (d && d.t === 'go' && d.go) { try { window.dispatchEvent(new CustomEvent('synco-go', { detail: d.go })); } catch (x) {} return; }
+    if (d && d.rid && cbs[d.rid]) { var f = cbs[d.rid]; delete cbs[d.rid]; f(d); } };
+  function caller(t) { return { call: function (op, extra) { return new Promise(function (res) {
+    var rid = t[0] + (++seq); cbs[rid] = res; var o = { t: t, op: op, rid: rid }; extra = extra || {}; for (var k in extra) o[k] = extra[k]; send(o);
+    setTimeout(function () { if (cbs[rid]) { delete cbs[rid]; res({ ok: false, timeout: true }); } }, op === 'get' || op === 'save' || op === 'perm' ? 120000 : 8000);
+  }); } }; }
+  window.SyncoBio = caller('bio');
+  window.SyncoNotif = caller('notif');
   // downloads: <a download href="blob:…"> (Excel, PDF, backups)
   document.addEventListener('click', function (e) {
     var a = e.target && e.target.closest ? e.target.closest('a[download]') : null; if (!a) return;
